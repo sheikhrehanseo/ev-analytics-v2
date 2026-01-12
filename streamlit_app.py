@@ -2,129 +2,114 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 import zipfile
-import os
+import re
 
 # --- PAGE CONFIG ---
-st.set_page_config(
-    page_title="Intelligent EV Analytics V3",
-    page_icon="⚡",
-    layout="wide"
-)
+st.set_page_config(page_title="Intelligent EV Analytics V3", page_icon="⚡", layout="wide")
 
-# --- GLOBAL STYLING ---
+# --- STYLING ---
 st.markdown("""
     <style>
     .main {background-color: #0E1117;}
     h1, h2, h3 {color: #00FF99; font-family: 'Segoe UI', sans-serif;}
-    .stButton>button {background-color: #00FF99; color: black; font-weight: bold; width: 100%;}
-    </style>
-    """, unsafe_allow_html=True)
+    .stMetric {background-color: #262730; border: 1px solid #444;}
+    </style>""", unsafe_allow_html=True)
 
 st.title("⚡ Intelligent EV Analytics: The Master Portal")
 st.markdown("### 🧬 Tri-Dataset Architecture: Market + Physics + Prices")
 
-# --- ROBUST DATA LOADER ---
+# --- ROBUST DATA LOADER (V3.1) ---
 @st.cache_data
 def load_and_process_data():
-    # Helper: Load largest CSV from Zip
-    def load_largest_csv(zip_name):
+    def load_csv(zip_name):
         try:
             with zipfile.ZipFile(zip_name, "r") as z:
-                csv_files = [f for f in z.namelist() if f.endswith('.csv') and '__MACOSX' not in f]
-                if not csv_files: return None
-                largest = max(csv_files, key=lambda x: z.getinfo(x).file_size)
-                return pd.read_csv(z.open(largest))
+                # Find valid CSV (ignore MACOSX)
+                files = [f for f in z.namelist() if f.endswith('.csv') and '__MACOSX' not in f]
+                return pd.read_csv(z.open(max(files, key=len))) if files else None
         except: return None
 
-    # Helper: Find column safely
-    def find_col(df, candidates, dataset_name):
-        # lower case check
-        for col in df.columns:
-            if col.lower().strip() in candidates:
-                return col
-        # If failed, raise error with details
-        raise ValueError(f"Could not find {candidates} in {dataset_name}. Found: {list(df.columns)}")
-
     try:
-        # 1. LOAD FILES
-        df_m = load_largest_csv("raw_data.zip")
-        df_s = load_largest_csv("specs_data.zip")
-        df_p = load_largest_csv("prices_data.zip")
+        # 1. LOAD RAW DATA
+        df_m = load_csv("raw_data.zip")   # Market
+        df_s = load_csv("specs_data.zip") # Specs
+        df_p = load_csv("prices_data.zip") # Prices
 
-        if df_m is None: raise ValueError("Failed to load raw_data.zip")
-        if df_s is None: raise ValueError("Failed to load specs_data.zip")
-        if df_p is None: raise ValueError("Failed to load prices_data.zip")
+        if df_m is None or df_s is None or df_p is None:
+            raise ValueError("One or more zip files could not be loaded.")
 
-        # 2. NORMALIZE KEYS (LOWERCASE)
-        # Market Data (A)
-        m_make = find_col(df_m, ['make', 'brand', 'manufacturer'], "Dataset A (Market)")
-        m_model = find_col(df_m, ['model', 'vehicle'], "Dataset A (Market)")
-        df_m['join_make'] = df_m[m_make].astype(str).str.lower().str.strip()
-        df_m['join_model'] = df_m[m_model].astype(str).str.lower().str.strip()
+        # 2. PREPARE MARKET DATA (Dataset A)
+        df_m['join_make'] = df_m['Make'].astype(str).str.lower().str.strip()
+        df_m['join_model'] = df_m['Model'].astype(str).str.lower().str.strip()
 
-        # Specs Data (B)
-        s_make = find_col(df_s, ['brand', 'make', 'manufacturer'], "Dataset B (Specs)")
-        s_model = find_col(df_s, ['model', 'model_name', 'vehicle'], "Dataset B (Specs)")
+        # 3. PREPARE SPECS DATA (Dataset B)
+        # Find make/model columns dynamically
+        s_make = next(c for c in df_s.columns if c.lower() in ['brand', 'make'])
+        s_model = next(c for c in df_s.columns if c.lower() in ['model', 'model_name'])
         df_s['join_make'] = df_s[s_make].astype(str).str.lower().str.strip()
         df_s['join_model'] = df_s[s_model].astype(str).str.lower().str.strip()
 
-        # Prices Data (C)
-        p_make = find_col(df_p, ['brand', 'make', 'car_name'], "Dataset C (Prices)")
-        p_model = find_col(df_p, ['model', 'model_name', 'vehicle'], "Dataset C (Prices)")
-        df_p['join_make'] = df_p[p_make].astype(str).str.lower().str.strip()
-        df_p['join_model'] = df_p[p_model].astype(str).str.lower().str.strip()
+        # 4. PREPARE PRICES DATA (Dataset C - The Fix)
+        # Check if we have 'Car_name' (Combined) instead of separate columns
+        if 'Car_name' in df_p.columns:
+            # Split "Tesla Model 3" -> "Tesla" | "Model 3"
+            split_data = df_p['Car_name'].astype(str).str.split(' ', n=1, expand=True)
+            df_p['join_make'] = split_data[0].str.lower().str.strip()
+            df_p['join_model'] = split_data[1].str.lower().str.strip()
+        else:
+            # Fallback to standard columns if they exist
+            p_make = next(c for c in df_p.columns if c.lower() in ['brand', 'make'])
+            p_model = next(c for c in df_p.columns if c.lower() in ['model', 'model_name'])
+            df_p['join_make'] = df_p[p_make].astype(str).str.lower().str.strip()
+            df_p['join_model'] = df_p[p_model].astype(str).str.lower().str.strip()
 
-        # 3. MERGE
+        # 5. MERGE PIPELINE
+        # Merge Market + Specs
         df_step1 = pd.merge(df_m, df_s, on=['join_make', 'join_model'], how='inner')
+        # Merge Result + Prices
         df_final = pd.merge(df_step1, df_p, on=['join_make', 'join_model'], how='inner')
 
-        # 4. CLEANUP
-        # Price (Try to find 'price' or 'msrp')
-        price_cols = [c for c in df_final.columns if 'price' in c.lower() or 'msrp' in c.lower()]
-        if price_cols:
-            # Pick the first one found
-            df_final['Final_Price_USD'] = df_final[price_cols[0]] * 1.1 # Approx Euro->USD
+        # 6. CLEANUP & CONVERSIONS
+        # Fix Price (Handle 'Price.DE.' and German formatting like 45.000)
+        price_col = next((c for c in df_final.columns if 'price' in c.lower()), None)
+        if price_col:
+            # Remove dots/commas if string, convert to float
+            if df_final[price_col].dtype == object:
+                df_final[price_col] = df_final[price_col].astype(str).str.replace('.', '', regex=False)
+            
+            df_final['Final_Price_USD'] = pd.to_numeric(df_final[price_col], errors='coerce') * 1.09 # Euro to USD
         else:
-            df_final['Final_Price_USD'] = 50000 # Fallback default
+            df_final['Final_Price_USD'] = 50000 # Default fallback
 
-        # Range (Try to find 'range')
-        range_cols = [c for c in df_s.columns if 'range' in c.lower()]
-        if range_cols:
-            df_final['Final_Range_Miles'] = df_final[range_cols[0]] * 0.621371
-            df_final = df_final[df_final['Final_Range_Miles'] > 10]
-        else:
-            raise ValueError("No 'Range' column found in Specs data.")
+        # Fix Range (KM -> Miles)
+        range_col = next((c for c in df_s.columns if 'range' in c.lower()), None)
+        if range_col:
+            df_final['Final_Range_Miles'] = df_final[range_col] * 0.621371
+            df_final = df_final[df_final['Final_Range_Miles'] > 10] # Filter bad data
 
         return df_final, df_s
 
     except Exception as e:
-        st.error(f"🛑 Data Processing Failed: {e}")
+        st.error(f"🛑 Critical Data Error: {e}")
         return None, None
 
-# Run Loader
+# --- APP LOGIC ---
 if 'df_main' not in st.session_state:
-    with st.spinner("Initializing Tri-Dataset Pipeline..."):
+    with st.spinner("Processing Tri-Dataset Pipeline..."):
         df_final, df_specs = load_and_process_data()
-        
         if df_final is not None:
             st.session_state['df_main'] = df_final
             st.session_state['df_specs'] = df_specs
-            st.success("✅ Data Pipeline Initialized!")
             st.rerun()
-        else:
-            st.stop()
 
-# --- METRICS ---
 if 'df_main' in st.session_state:
     df = st.session_state['df_main']
     st.markdown("---")
-    
     if len(df) == 0:
-        st.error("⚠️ Merge resulted in 0 rows. Check if 'Make/Model' names match (e.g. 'Tesla' vs 'TESLA').")
+        st.warning("⚠️ 0 Matches Found. Try checking if car names match (e.g. 'Tesla Model 3' vs 'Model 3').")
     else:
         c1, c2, c3 = st.columns(3)
-        c1.metric("Vehicles", len(df))
+        c1.metric("Vehicles Analyzed", len(df))
         c2.metric("Avg Range", f"{df['Final_Range_Miles'].mean():.0f} mi")
         c3.metric("Avg Price", f"${df['Final_Price_USD'].mean():,.0f}")
-        
-        st.info("👈 Select a module from the sidebar to begin.")
+        st.success("✅ System Ready. Use the sidebar to navigate.")
